@@ -3,13 +3,16 @@ use itertools::Itertools;
 use svd_parser::svd::{Device, Peripheral, PeripheralInfo};
 use yaml_rust::{yaml::Hash, Yaml};
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::{fs::File, io::Read, path::Path};
 
 use super::iterators::{MatchIter, Matched};
-use super::peripheral::{PeripheralExt, RegisterBlockExt};
+use super::peripheral::{replace_hash_iter_helper, PeripheralExt, RegisterBlockExt};
 use super::yaml_ext::{AsType, GetVal};
-use super::{abspath, matchname, Config, PatchResult, Spec, VAL_LVL};
+use super::{
+    abspath, matchname, replace_dim_element_peripheral, Config, PatchResult, Spec, VAL_LVL,
+};
 use super::{make_address_block, make_address_blocks, make_cpu, make_interrupt, make_peripheral};
 use super::{make_dim_element, modify_dim_element, modify_register_properties};
 
@@ -28,6 +31,7 @@ pub trait DeviceExt {
         "_add",
         "_derive",
         "_rebase",
+        "_replace",
     ];
 
     /// Iterates over all peripherals that match pspec
@@ -50,6 +54,9 @@ pub trait DeviceExt {
 
     /// Modify pspec inside device according to pmod
     fn modify_peripheral(&mut self, pspec: &str, pmod: &Hash) -> PatchResult;
+
+    /// Replace pspec inside device according to prep
+    fn replace_peripheral_metadata(&mut self, pspec: &str, prep: &Hash) -> PatchResult;
 
     /// Add pname given by padd to device
     fn add_peripheral(&mut self, pname: &str, padd: &Hash) -> PatchResult;
@@ -137,6 +144,79 @@ impl DeviceExt for Device {
                 _ => self
                     .modify_peripheral(key, val.hash()?)
                     .with_context(|| format!("Modifying peripherals matched to `{key}`"))?,
+            }
+        }
+
+        // Handle any replaces
+        for (key, val) in device.hash_iter("_replace") {
+            let key = key.str()?;
+            // Since the val will always also be a hash for replacement, just hash it up front
+            let val_hashed = val.hash()?;
+            match key {
+                "cpu" | "addressUnitBits" | "width" | "size" | "access" | "protection"
+                | "resetValue" | "resetMask" => {
+                    return Err(anyhow!(
+                        "Regex replace not supported for field `{key}`, use `_modify`."
+                    ))
+                }
+                "_peripherals" => {
+                    for (pspec, prep) in val_hashed {
+                        let pspec = pspec.str()?;
+                        self.replace_peripheral_metadata(pspec, prep.hash()?)
+                            .with_context(|| {
+                                format!("Replacing peripheral metadata matched to `{pspec}`")
+                            })?;
+                    }
+                }
+                "vendor" => {
+                    self.vendor = Some(replace_hash_iter_helper(
+                        self.vendor.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                "vendorID" => {
+                    self.vendor_id = Some(replace_hash_iter_helper(
+                        self.vendor_id.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                "name" => self.name = replace_hash_iter_helper(self.name.as_str(), val_hashed)?,
+                "series" => {
+                    self.series = Some(replace_hash_iter_helper(
+                        self.series.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                "version" => {
+                    self.version = replace_hash_iter_helper(self.version.as_str(), val_hashed)?
+                }
+                "description" => {
+                    self.description =
+                        replace_hash_iter_helper(self.description.as_str(), val_hashed)?
+                }
+                "licenseText" => {
+                    self.license_text = Some(replace_hash_iter_helper(
+                        self.license_text.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                "headerSystemFilename" => {
+                    self.header_system_filename = Some(replace_hash_iter_helper(
+                        self.header_system_filename.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                "headerDefinitionsPrefix" => {
+                    self.header_definitions_prefix = Some(replace_hash_iter_helper(
+                        self.header_definitions_prefix.clone().unwrap().as_str(),
+                        val_hashed,
+                    )?)
+                }
+                _ => self
+                    .replace_peripheral_metadata(key, val_hashed)
+                    .with_context(|| {
+                        format!("Replacing peripheral metadata for those matched to `{key}`")
+                    })?,
             }
         }
 
@@ -287,6 +367,52 @@ impl DeviceExt for Device {
                     if modified.contains(old_name) {
                         *old_name = value.into();
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_peripheral_metadata(&mut self, pspec: &str, prep: &Hash) -> PatchResult {
+        let mut replaced = HashMap::new();
+        let ptags = self.iter_peripherals(pspec).collect::<Vec<_>>();
+        for ptag in ptags {
+            println!("Peripheral matched name specified: {:?}", ptag);
+        }
+        let ptags = self.iter_peripherals(pspec).collect::<Vec<_>>();
+        if !ptags.is_empty() {
+            for ptag in ptags {
+                // Keep track of the peripherals whose names had to be replaced,
+                // we need to ensure there are no derived peripherals that lose track of their
+                // parent.
+                if let Some(new_name) = replace_dim_element_peripheral(ptag, prep)? {
+                    replaced.insert(ptag.name.clone(), new_name);
+                }
+                if let Some(ints) = prep.get_hash("interrupts")? {
+                    return Err(anyhow!(
+                        "Interrupts {:?} included in regex replace block, not supported",
+                        ints
+                    ));
+                }
+                if let Some(abrep) = prep.get_hash("addressBlock").ok().flatten() {
+                    return Err(anyhow!(
+                        "Address block {:?} included in regex replace block, not supported",
+                        abrep
+                    ));
+                } else if let Some(abrep) = prep.get_vec("addressBlocks").ok().flatten() {
+                    return Err(anyhow!(
+                        "Address block {:?} included in regex replace block, not supported",
+                        abrep
+                    ));
+                }
+            }
+        }
+
+        // Update the name of all derived peripherals to their new parent name if applicable.
+        for p in self.peripherals.iter_mut() {
+            if let Some(derived_name) = p.derived_from.as_mut() {
+                if let Some(new_name) = replaced.get(derived_name) {
+                    *derived_name = new_name.into();
                 }
             }
         }
@@ -463,6 +589,8 @@ impl DeviceExt for Device {
 
 #[cfg(test)]
 mod tests {
+    use svd_rs::MaybeArray;
+
     use super::*;
     use crate::test_utils;
     use std::path::Path;
@@ -540,5 +668,28 @@ mod tests {
             dac1.description,
             Some("Digital-to-analog converter".to_string())
         );
+    }
+
+    #[test]
+    fn replace_device_metadata_whole_file() {
+        test_utils::test_expected(Path::new("replace")).unwrap()
+    }
+
+    #[test]
+    fn replace_device_metadata() {
+        let (mut device, yaml) = test_utils::get_patcher(Path::new("replace")).unwrap();
+
+        // Check the initial device config
+        assert_eq!(&device.version, "1.6");
+        assert_eq!(&device.description, "");
+        assert_eq!(&device.name, "STM32L4x2_STM32L4x2");
+
+        // Process the device
+        device.process(&yaml, &Default::default()).unwrap();
+
+        // Check the final device config
+        assert_eq!(&device.version, "1.6");
+        assert_eq!(&device.description, "");
+        assert_eq!(&device.name, "STM32L4x2");
     }
 }

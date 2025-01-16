@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Ok};
 use fancy_regex::Regex;
+use hashlink::LinkedHashMap;
 use itertools::Itertools;
 use svd::Name;
 use svd_parser::expand::BlockPath;
@@ -14,7 +15,7 @@ use super::register::{RegisterExt, RegisterInfoExt};
 use super::yaml_ext::{AsType, GetVal, ToYaml};
 use super::{
     check_offsets, common_description, make_dim_element, matchname, matchsubspec,
-    modify_dim_element, spec_ind, Config, PatchResult, Spec, VAL_LVL,
+    modify_dim_element, replace_dim_element_register, spec_ind, Config, PatchResult, Spec, VAL_LVL,
 };
 use super::{make_cluster, make_interrupt, make_register};
 
@@ -107,6 +108,9 @@ pub(crate) trait InterruptExt {
 
     /// Modify ispec according to imod
     fn modify_interrupt(&mut self, ispec: &str, imod: &Hash) -> PatchResult;
+
+    /// Replace metadata of an interrupt according to regular expression(s)
+    fn replace_interrupt_metadata(&mut self, ispec: &str, irep: &Hash) -> PatchResult;
 }
 
 /// Collecting methods for processing peripheral/cluster contents
@@ -398,6 +402,69 @@ pub(crate) trait RegisterBlockExt: Name {
         }
         modify_cluster(ctags, cmod, bpath)
     }
+
+    fn replace_child_metadata(
+        &mut self,
+        rcspec: &str,
+        rcmod: &Hash,
+        bpath: &BlockPath,
+    ) -> PatchResult {
+        let (rcspec, ignore) = rcspec.spec();
+        let rtags = self.iter_registers(rcspec).collect::<Vec<_>>();
+        if rtags.is_empty() && !ignore {
+            let ctags = self.iter_clusters(rcspec).collect::<Vec<_>>();
+            if ctags.is_empty() {
+                let present = self.present_registers();
+                Err(anyhow!(
+                    "Could not find `{bpath}:{rcspec}. Present registers: {present}.`"
+                ))
+            } else {
+                modify_cluster(ctags, rcmod, bpath)
+            }
+        } else {
+            modify_register(rtags, rcmod, bpath)
+        }
+    }
+
+    /// Modify rspec inside ptag according to rmod
+    fn replace_register_metadata(
+        &mut self,
+        rspec: &str,
+        rrep: &Hash,
+        bpath: &BlockPath,
+    ) -> PatchResult {
+        let (rspec, ignore) = rspec.spec();
+        let rtags = self.iter_registers(rspec).collect::<Vec<_>>();
+        if rtags.is_empty() && !ignore {
+            let present = self.present_registers();
+            return Err(anyhow!(
+                "Could not find `{bpath}:{rspec}. Present registers: {present}.`"
+            ));
+        }
+        for rtag in rtags {
+            replace_dim_element_register(rtag, rrep)?;
+        }
+        Ok(())
+    }
+
+    /// Modify cspec inside ptag according to cmod
+    fn replace_cluster_metadata(
+        &mut self,
+        cspec: &str,
+        cmod: &Hash,
+        bpath: &BlockPath,
+    ) -> PatchResult {
+        let (cspec, ignore) = cspec.spec();
+        let ctags = self.iter_clusters(cspec).collect::<Vec<_>>();
+        if ctags.is_empty() && !ignore {
+            let present = self.present_clusters();
+            return Err(anyhow!(
+                "Could not find cluster `{bpath}:{cspec}. Present clusters: {present}.`"
+            ));
+        }
+        modify_cluster(ctags, cmod, bpath)
+    }
+
     /// Work through a register or cluster
     fn process_child(
         &mut self,
@@ -898,6 +965,17 @@ fn modify_register(rtags: Vec<&mut Register>, rmod: &Hash, bpath: &BlockPath) ->
     Ok(())
 }
 
+fn replace_register_metadata(
+    rtags: Vec<&mut Register>,
+    rrep: &Hash,
+    bpath: &BlockPath,
+) -> PatchResult {
+    for rtag in rtags {
+        replace_dim_element_register(rtag, rrep);
+    }
+    Ok(())
+}
+
 fn modify_cluster(ctags: Vec<&mut Cluster>, cmod: &Hash, bpath: &BlockPath) -> PatchResult {
     let cluster_builder = make_cluster(cmod, Some(bpath))?;
     let dim = make_dim_element(cmod)?;
@@ -1100,23 +1178,6 @@ impl PeripheralExt for Peripheral {
                 .with_context(|| format!("Stripping suffix `{suffix}` from register names"))?;
         }
 
-        // Handle duplicate removal
-        for delimiter in pmod.str_vec_iter("_remove_duplicate")? {
-            println!("I'M AT LEAST TRYING SOMETHING!!!");
-            if let Some(delimiter) = delimiter.chars().nth(0) {
-                self.remove_duplicate(delimiter).with_context(|| {
-                    format!(
-                        "Removing largest duplicate substring conjoined by delimiter {}",
-                        delimiter
-                    )
-                })?;
-            } else {
-                return Err(anyhow!(
-                    "`_remove_duplicate` requires a delimiter of length 1 to break name up by"
-                ));
-            }
-        }
-
         // Handle modifications
         for (rspec, rmod) in pmod.hash_iter("_modify") {
             let rmod = rmod.hash()?;
@@ -1146,6 +1207,45 @@ impl PeripheralExt for Peripheral {
                 rcspec => self.modify_child(rcspec, rmod, &ppath).with_context(|| {
                     format!("Modifying registers or clusters matched to `{rcspec}`")
                 })?,
+            }
+        }
+
+        // Handle replace metadata
+        for (rspec, rrep) in pmod.hash_iter("_replace") {
+            let rrep = rrep.hash()?;
+            match rspec.str()? {
+                "_registers" => {
+                    for (rspec, val) in rrep {
+                        let rspec = rspec.str()?;
+                        self.replace_register_metadata(rspec, val.hash()?, &ppath)
+                            .with_context(|| {
+                                format!("Replacing metadata in registers matched to `{rspec}`")
+                            })?;
+                    }
+                }
+                "_interrupts" => {
+                    for (ispec, val) in rrep {
+                        let ispec = ispec.str()?;
+                        self.replace_interrupt_metadata(ispec, val.hash()?)
+                            .with_context(|| {
+                                format!("Replacing metadata in interrupts matched to `{ispec}`")
+                            })?;
+                    }
+                }
+                "_clusters" => {
+                    for (cspec, val) in rrep {
+                        let cspec = cspec.str()?;
+                        self.replace_cluster_metadata(cspec, val.hash()?, &ppath)
+                            .with_context(|| {
+                                format!("Replacing metadata in clusters matched to `{cspec}`")
+                            })?;
+                    }
+                }
+                rcspec => self
+                    .replace_child_metadata(rcspec, rrep, &ppath)
+                    .with_context(|| {
+                        format!("Replacing metadata of registers or clusters matched to `{rcspec}`")
+                    })?,
             }
         }
 
@@ -1328,6 +1428,13 @@ impl InterruptExt for Peripheral {
     }
 
     fn modify_interrupt(&mut self, ispec: &str, imod: &Hash) -> PatchResult {
+        for itag in self.iter_interrupts(ispec) {
+            itag.modify_from(make_interrupt(imod)?, VAL_LVL)?;
+        }
+        Ok(())
+    }
+
+    fn replace_interrupt_metadata(&mut self, ispec: &str, imod: &Hash) -> PatchResult {
         for itag in self.iter_interrupts(ispec) {
             itag.modify_from(make_interrupt(imod)?, VAL_LVL)?;
         }
@@ -1906,7 +2013,31 @@ fn collect_in_cluster(
     Ok(())
 }
 
+pub fn replace_hash_iter_helper(
+    source: &str,
+    replacements: &LinkedHashMap<Yaml, Yaml>,
+) -> anyhow::Result<String> {
+    println!(
+        "Replacing source string {} with replacement regex mappings {:?}",
+        source, replacements
+    );
+    let mut output_str = String::from(source);
+    for (pattern, replacement) in replacements.iter() {
+        let _ = replace_helper(
+            &mut output_str,
+            pattern.as_str().unwrap(),
+            replacement.as_str().unwrap(),
+        )?;
+    }
+
+    Ok(output_str)
+}
+
 /// Replaces matches of the given regex in a mutable input string with the specified replacement.
+///
+/// TODO
+/// Move this to a more logical place in code, since so widely used and not just at the peripheral
+/// scope. Perhaps `mod.rs`.
 ///
 /// # Arguments
 /// * `haystack` - A mutable reference to the string to be modified.
@@ -1915,7 +2046,16 @@ fn collect_in_cluster(
 ///
 /// # Returns
 /// Returns `true` if at least one replacement was made, otherwise `false`.
-fn replace_helper(haystack: &str, pattern: &str, replacement: &str) -> anyhow::Result<String> {
+pub fn replace_helper(
+    haystack: &mut String,
+    pattern: &str,
+    replacement: &str,
+) -> anyhow::Result<bool> {
+    println!(
+        "Attempting to find substring matching {} regex pattern within {}, to replace with {}",
+        pattern, haystack, replacement
+    );
+
     // Compile the regex
     let re = Regex::new(pattern).map_err(|e| {
         anyhow!(
@@ -1941,28 +2081,13 @@ fn replace_helper(haystack: &str, pattern: &str, replacement: &str) -> anyhow::R
         let end = needle.end();
 
         // Replace the match with the replacement string
-        let result = format!("{}{}{}", &haystack[..start], replacement, &haystack[end..]);
-        Ok(result)
+        *haystack = format!("{}{}{}", &haystack[..start], replacement, &haystack[end..]);
+        Ok(true)
     } else {
         // No match found, return the original string
         println!("No match found!");
-        Ok(haystack.to_string())
+        Ok(false)
     }
-
-    // Perform the replacement
-    //if re.is_match(input).map_err(|e| {
-    //    anyhow!(
-    //        "Encountered error {} when searching input {} for match to regex {}",
-    //        e,
-    //        input,
-    //        pattern
-    //    )
-    //})? {
-    //    *input = re.replace_append(input, replacement);
-    //    Ok(true)
-    //} else {
-    //    Ok(false)
-    //}
 }
 
 #[cfg(test)]
@@ -1988,11 +2113,12 @@ mod tests {
 
     #[test]
     fn test_replace_helper_simple() -> Result<()> {
-        let test_input = "hello world, hello universe";
+        let mut test_input = String::from("hello world, hello universe");
         let test_regex = "hello";
         let replace_with = "hi";
-        let replace_output = replace_helper(test_input, test_regex, replace_with).unwrap();
-        assert_eq!(replace_output, String::from("hi world, hello universe"));
+        let replaced_something = replace_helper(&mut test_input, test_regex, replace_with).unwrap();
+        assert_eq!(test_input, String::from("hi world, hello universe"));
+        assert!(replaced_something);
         Ok(())
     }
 
@@ -2000,7 +2126,7 @@ mod tests {
     fn test_replace_helper_remove_duplicate_sections() -> Result<()> {
         //let mut test_input: String = String::from("foo_bar_bazfoo_bar_baz");
         // String::from("ip_name_peripheral_name_field_name_field_name");
-        let test_input = "foo_bar_baz_foo_bar_baz_quz";
+        let mut test_input = String::from("foo_bar_baz_foo_bar_baz_quz");
 
         // let test_regex = r"\b((?:\w+_)+\w+)\b.*\b\1\b";
         // let test_regex = r"(^|!)([^!]+)!(|.+!)\2(!|$)";
@@ -2015,8 +2141,25 @@ mod tests {
         let test_regex = r"((?:\w+_)+\w+)\1";
         let test_regex = r"^((?:\w+_)+\w+)(?=\1)";
         let replace_with = "";
-        let replace_out = replace_helper(test_input, test_regex, replace_with).unwrap();
-        assert_eq!(replace_out, "foo_bar_baz_quz");
+        let replace_out = replace_helper(&mut test_input, test_regex, replace_with).unwrap();
+        assert_eq!(test_input, String::from("foo_bar_baz_quz"));
+        assert!(replace_out);
+
+        test_input = String::from("STM32L4x2_ok_STM32L4x2_ok_blah");
+        let test_regex = r"((?:\w+_)+\w+)(?=\1(?:_|$))";
+        let test_regex = r"^((?:\w+_)+\w+)(?=\1)";
+        let replace_out = replace_helper(&mut test_input, test_regex, replace_with).unwrap();
+        assert_eq!(test_input, String::from("STM32L4x2_ok_blah"));
+        assert!(replace_out);
+
+        test_input = String::from("STM32L4x2_STM32L4x2");
+        let test_regex = r"((?:\w+_)+\w+)(?=\1(?:_|$))";
+        let test_regex = r"\b(\w+)_\1\b";
+        let test_regex = r"\b(\w+)(?=_\1\b)_";
+        let replace_out = replace_helper(&mut test_input, test_regex, replace_with).unwrap();
+        assert_eq!(test_input, String::from("STM32L4x2"));
+        assert!(replace_out);
+
         Ok(())
     }
 }
